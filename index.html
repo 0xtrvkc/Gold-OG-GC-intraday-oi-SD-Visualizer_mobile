@@ -340,6 +340,8 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
         <span id="status-txt">Loading…</span>
         <span id="countdown">·  —</span>
       </div>
+      <div id="fetch-alert" style="font-size:9.5px;font-family:var(--mono);color:var(--fg3);letter-spacing:0.03em;margin-top:2px;">Waiting for first fetch…</div>
+      <div id="data-cache-badge" style="display:none;font-size:9.5px;font-family:var(--mono);color:var(--danger);letter-spacing:0.03em;margin-top:2px;"></div>
     </div>
     <div class="hdr-right">
       <button class="icon-btn" id="btn-refresh" title="Refresh">↺</button>
@@ -493,6 +495,15 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
           <div class="input-group full">
             <div class="input-label">Vol at Price (%) — auto from smile, edit to override</div>
             <input type="number" id="inp-vol-val" value="" placeholder="auto" step="0.01" min="0">
+          </div>
+
+          <div class="input-group full">
+            <div class="input-label">GitHub Token (optional)</div>
+            <div class="field-row">
+              <input type="password" id="inp-github-token" placeholder="raises API limit to 5,000/hr"
+                title="Optional read-only personal access token — raises GitHub's API limit from 60/hr to 5,000/hr for the 0.99 DTE lookup. Stored only in this browser, sent only to api.github.com.">
+              <button class="mode-btn" onclick="handleSaveGithubToken()">Save</button>
+            </div>
           </div>
 
         </div>
@@ -708,6 +719,10 @@ let oiData     = null;
 let refreshTimer = null;
 let countdownTimer = null;
 let countdownSec   = 0;
+// Adaptive backoff for the main auto-refresh loop: multiplies the user's
+// chosen interval when fetchData() fails, resets to 1 on the next success.
+let refreshBackoffMultiplier = 1;
+const REFRESH_BACKOFF_MAX = 8;
 let intradayUpdatedAt = null;
 let oiUpdatedAt       = null;
 let garrowIvOverride = null;
@@ -1691,36 +1706,47 @@ function _render() {
 async function fetchData() {
   const pulse=document.getElementById('pulse-dot');
   const statusTxt=document.getElementById('status-txt');
+  const alertEl=document.getElementById('fetch-alert');
   pulse.classList.remove('stale');
   statusTxt.textContent='Fetching…';
+  if (alertEl) { alertEl.textContent='⏳ Fetching…'; alertEl.style.color='var(--fg3)'; }
   const err=document.getElementById('err-banner');
   err.style.display='none';
   try {
-    const bust='?bust='+Date.now();
-    const [r1,r2]=await Promise.all([fetch(DATA_URL+bust),fetch(OI_URL+bust)]);
+    // No cache-busting query string and no 'no-store': using the browser's
+    // normal HTTP cache with 'no-cache' means every tick still revalidates
+    // with GitHub's CDN (so the data is never stale), but an unchanged file
+    // comes back as a cheap 304 Not Modified instead of re-downloading the
+    // full body.
+    const [r1,r2]=await Promise.all([
+      fetch(DATA_URL, { cache: 'no-cache' }),
+      fetch(OI_URL,   { cache: 'no-cache' }),
+    ]);
     if (!r1.ok) throw new Error('Intraday fetch failed: '+r1.status);
     const text=await r1.text();
     liveData=parseIntraday(text);
     intradayUpdatedAt = new Date();
+    saveDataCache(LIVE_DATA_CACHE_KEY, liveData);
+    liveDataIsCached = false;
+    updateDataCacheBadge();
 
     if (r2.ok) {
       const oit=await r2.text();
       oiData=parseIntraday(oit);
       oiUpdatedAt = new Date();
+      saveDataCache(OI_DATA_CACHE_KEY, oiData);
       if (oiIvOpen === null && oiData.rows && oiData.rows.length) {
         const oiVolRows = oiData.rows.filter(r => r.vol != null && r.vol > 0);
         if (oiVolRows.length) {
           const minIv = Math.min(...oiVolRows.map(r => r.vol));
-          oiIvOpen = minIv;
-          saveOiIvOpen(minIv);
-          document.getElementById('val-oi-iv-open').textContent = (minIv * 100).toFixed(2) + '%';
-          syncGArrowAutoField();
+          applyOiIvOpenResult(minIv, 'fallback-live');
         }
       }
     }
 
     const now=new Date();
     statusTxt.textContent='Updated '+now.toLocaleTimeString();
+    if (alertEl) { alertEl.textContent='✓ Fetch OK · '+now.toLocaleTimeString(); alertEl.style.color='var(--oi-call)'; }
     if (liveData.title) document.getElementById('h-title').textContent=liveData.title.includes('SD')?liveData.title:'SD Visualizer';
     if (liveData.future!=null && liveData.dte) {
       const dte=parseFloat(liveData.dte), fut=liveData.future;
@@ -1768,11 +1794,32 @@ async function fetchData() {
     updateGauge();
     if (zoomAutoMode) { fitZoomToData(); render(); }
     recordHistoryPoint();
+    refreshBackoffMultiplier = 1; // success — drop back to the user's chosen interval
   } catch(e) {
     err.style.display='block';
     err.textContent='⚠ Error fetching data: '+e.message;
     pulse.classList.add('stale');
     statusTxt.textContent='Fetch failed';
+    if (alertEl) { alertEl.textContent='⚠ Fetch failed: '+e.message; alertEl.style.color='var(--danger)'; }
+    // Adaptive backoff: keep asking at the same cadence during an outage
+    // just makes it worse — back off (capped), recover on next success.
+    refreshBackoffMultiplier = Math.min(REFRESH_BACKOFF_MAX, refreshBackoffMultiplier * 2);
+    // Last-known-good fallback: only kicks in if nothing has ever loaded
+    // successfully this session (e.g. a reload during an outage).
+    if (liveData === null) {
+      const cachedLive = loadDataCache(LIVE_DATA_CACHE_KEY);
+      if (cachedLive) {
+        liveData = cachedLive.data;
+        liveDataIsCached = true;
+        liveDataCacheTs = cachedLive.ts;
+        const cachedOi = loadDataCache(OI_DATA_CACHE_KEY);
+        if (cachedOi) oiData = cachedOi.data;
+        updateDataCacheBadge();
+        render();
+      }
+    }
+    const sdot=document.getElementById('sdg-dot');
+    if (sdot) sdot.classList.add('stale');
   }
 }
 
@@ -1859,7 +1906,11 @@ document.getElementById('btn-refresh').addEventListener('click',()=>{
   fetchData();
   fetchMacro();
   fetchSnaplogTimestamps();
-  resetCountdown(parseInt(document.getElementById('sel-interval').value)/1000);
+  clearTimeout(refreshTimer);
+  refreshBackoffMultiplier = 1;
+  const ms = parseInt(document.getElementById('sel-interval').value);
+  resetCountdown(ms/1000);
+  refreshTimer = setTimeout(runRefreshCycle, ms);
 });
 function resetMean() {
   const meanInp = document.getElementById('inp-mean');
@@ -1889,11 +1940,22 @@ function resetCountdown(sec) {
     if (countdownSec<=0) { clearInterval(countdownTimer); }
   },1000);
 }
+// Self-rescheduling (setTimeout, not setInterval) so each cycle waits for
+// the previous fetches to finish before starting the next, and applies the
+// current backoff multiplier fresh each time.
+async function runRefreshCycle() {
+  await Promise.allSettled([fetchGoldPrice(), fetchData(), fetchMacro()]);
+  const baseMs = parseInt(document.getElementById('sel-interval').value);
+  const effectiveMs = baseMs * refreshBackoffMultiplier;
+  resetCountdown(effectiveMs / 1000);
+  refreshTimer = setTimeout(runRefreshCycle, effectiveMs);
+}
 function scheduleRefresh() {
-  clearInterval(refreshTimer);
+  clearTimeout(refreshTimer);
+  refreshBackoffMultiplier = 1; // user picked a new interval — start clean, not mid-backoff
   const ms=parseInt(document.getElementById('sel-interval').value);
-  refreshTimer=setInterval(()=>{ fetchGoldPrice(); fetchData(); fetchMacro(); resetCountdown(ms/1000); },ms);
   resetCountdown(ms/1000);
+  refreshTimer = setTimeout(runRefreshCycle, ms);
 }
 document.getElementById('sel-interval').addEventListener('change',()=>{ scheduleRefresh(); });
 
@@ -1919,26 +1981,118 @@ const GOLD_CACHE_KEY    = 'gcf_gold_cache_v1';
 const OI_IV_OPEN_KEY    = 'gcf_oi_iv_open_v1';
 const OI_REPO      = 'pageth/Vol2VolData';
 const OI_FILE_PATH = 'OIData.txt';
-let oiIvOpen = null;
 
-function loadOiIvOpen() {
+// In-memory: the locked OI min-IV for today (set on first OI fetch of the day)
+let oiIvOpen = null;        // decimal form e.g. 0.123
+let oiIvOpenSource = null;  // 'exact' | 'fallback-earliest' | 'fallback-live' | null
+let oiIvOpenRetryTimer = null;
+
+// Confidence ranking — a result can only ever *replace* the current value if
+// its source outranks (or ties, for a same-source refresh) what's already
+// locked in.
+const OI_IV_SOURCE_RANK = { 'exact': 3, 'fallback-earliest': 2, 'fallback-live': 1 };
+
+// Retry backoff schedule (minutes); caps at the last entry rather than
+// retrying forever at full speed. OI_RETRY_MAX_ATTEMPTS bounds total
+// attempts per day.
+const OI_RETRY_SCHEDULE_MIN = [2, 5, 15, 30, 60];
+const OI_RETRY_MAX_ATTEMPTS = 12;
+
+function loadOiIvOpenState() {
   try {
     const raw = localStorage.getItem(OI_IV_OPEN_KEY);
-    if (!raw) return;
-    const { date, minIv } = JSON.parse(raw);
+    if (!raw) return null;
+    const state = JSON.parse(raw);
     const today = new Date().toISOString().slice(0, 10);
-    if (date === today && minIv > 0) {
-      oiIvOpen = minIv;
-      document.getElementById('val-oi-iv-open').textContent = (minIv * 100).toFixed(2) + '%';
-      syncGArrowAutoField();
-    }
-  } catch(e) {}
+    if (state.date !== today) return null; // yesterday's state — start fresh
+    return state;
+  } catch(e) { return null; }
 }
-function saveOiIvOpen(minIv) {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    localStorage.setItem(OI_IV_OPEN_KEY, JSON.stringify({ date: today, minIv }));
-  } catch(e) {}
+function saveOiIvOpenState(state) {
+  try { localStorage.setItem(OI_IV_OPEN_KEY, JSON.stringify(state)); } catch(e) {}
+}
+
+// Dims the stat + explains provenance on hover whenever the locked value
+// isn't the authoritative exact match yet.
+function updateOiIvOpenBadge(detail) {
+  const el = document.getElementById('val-oi-iv-open');
+  if (!el) return;
+  if (oiIvOpenSource === 'exact') {
+    el.style.opacity = '';
+    el.title = detail || '[oi-open] locked from the exact 0.99 DTE snapshot';
+  } else if (oiIvOpenSource) {
+    el.style.opacity = '0.55';
+    const labels = { 'fallback-earliest': 'earliest commit of the day', 'fallback-live': "today's live tick" };
+    el.title = detail || ('[oi-open] provisional value from ' + (labels[oiIvOpenSource] || oiIvOpenSource) +
+      ' — retrying in the background for the exact 0.99 DTE snapshot');
+  }
+}
+
+// Central write path for oiIvOpen — every candidate source routes through
+// here so the confidence ranking is enforced in exactly one place.
+function applyOiIvOpenResult(minIv, source, detail) {
+  if (!(minIv > 0)) return;
+  const newRank = OI_IV_SOURCE_RANK[source] || 0;
+  const curRank = OI_IV_SOURCE_RANK[oiIvOpenSource] || 0;
+  if (oiIvOpen !== null && newRank <= curRank) return; // nothing to upgrade
+
+  oiIvOpen = minIv;
+  oiIvOpenSource = source;
+  document.getElementById('val-oi-iv-open').textContent = (minIv * 100).toFixed(2) + '%';
+  updateOiIvOpenBadge(detail);
+  syncGArrowAutoField();
+  render();
+
+  const today = new Date().toISOString().slice(0, 10);
+  const prior = loadOiIvOpenState();
+  const attempts = (prior && prior.date === today) ? (prior.attempts || 0) : 0;
+  saveOiIvOpenState({ date: today, minIv, source, attempts, nextRetryAt: source === 'exact' ? null : (prior?.nextRetryAt ?? null) });
+
+  if (source === 'exact' && oiIvOpenRetryTimer) {
+    clearTimeout(oiIvOpenRetryTimer);
+    oiIvOpenRetryTimer = null;
+  }
+}
+
+// Paints whatever was cached from a previous load, then resumes the retry
+// schedule (respecting a persisted nextRetryAt) if it isn't yet exact.
+function loadOiIvOpen() {
+  const state = loadOiIvOpenState();
+  if (!state || !(state.minIv > 0)) return;
+  oiIvOpen = state.minIv;
+  oiIvOpenSource = state.source || 'fallback-live';
+  document.getElementById('val-oi-iv-open').textContent = (state.minIv * 100).toFixed(2) + '%';
+  updateOiIvOpenBadge();
+  syncGArrowAutoField();
+
+  if (state.source !== 'exact' && (state.attempts || 0) < OI_RETRY_MAX_ATTEMPTS) {
+    const now = Date.now();
+    const delay = state.nextRetryAt ? Math.max(0, state.nextRetryAt - now) : 0;
+    scheduleOiIvOpenRetry(state.attempts || 0, delay);
+  }
+}
+
+function scheduleOiIvOpenRetry(attemptsSoFar, delayMs) {
+  if (attemptsSoFar >= OI_RETRY_MAX_ATTEMPTS) return; // give up for today — best fallback stands
+  const delay = delayMs != null ? delayMs : OI_RETRY_SCHEDULE_MIN[Math.min(attemptsSoFar, OI_RETRY_SCHEDULE_MIN.length - 1)] * 60000;
+  const today = new Date().toISOString().slice(0, 10);
+  const prior = loadOiIvOpenState();
+  if (prior && prior.date === today) saveOiIvOpenState({ ...prior, nextRetryAt: Date.now() + delay });
+  if (oiIvOpenRetryTimer) clearTimeout(oiIvOpenRetryTimer);
+  oiIvOpenRetryTimer = setTimeout(() => retryOiIvOpenLookup(attemptsSoFar), delay);
+}
+
+async function retryOiIvOpenLookup(attemptsSoFar) {
+  const nextAttempts = attemptsSoFar + 1;
+  const result = await fetchFirstOiOfDay();
+  if (result && result.minIv > 0) {
+    applyOiIvOpenResult(result.minIv, result.source, result.detail);
+    if (result.source === 'exact') return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const prior = loadOiIvOpenState();
+  if (prior && prior.date === today) saveOiIvOpenState({ ...prior, attempts: nextAttempts });
+  scheduleOiIvOpenRetry(nextAttempts);
 }
 
 const OI_SOURCE_UTC_OFFSET_HOURS = 7;
@@ -1952,37 +2106,110 @@ function utcPlus7DayStartIso() {
   return new Date(trueUtcMs).toISOString();
 }
 
+// Target DTE for the "IV at 1DTE" lookup — the file's DTE decays
+// continuously through the day, so we scan for the specific snapshot where
+// it reads 0.99 (a fixed, repeatable reference point) instead of just using
+// whichever DTE the earliest commit of the day happens to show.
+const TARGET_OI_OPEN_DTE = 0.99;
+const TARGET_OI_OPEN_DTE_TOL = 0.005;
+
 async function fetchFirstOiOfDay() {
   try {
     const sinceIso = utcPlus7DayStartIso();
-    const MAX_PAGES = 20;
+    const MAX_PAGES = 20; // safety cap: 20 * 100 = 2000 commits/day
     let page = 1;
-    let lastFullOrPartialPage = null;
+    let allCommits = [];
     while (page <= MAX_PAGES) {
       const commitsUrl = `https://api.github.com/repos/${OI_REPO}/commits?path=${encodeURIComponent(OI_FILE_PATH)}&since=${sinceIso}&per_page=100&page=${page}`;
-      const cRes = await fetchWithTimeout(commitsUrl, 8000);
+      const cRes = await fetchWithTimeout(commitsUrl, 8000, 'no-cache', githubApiHeaders());
       if (!cRes.ok) {
         if (cRes.status === 403 || cRes.status === 429) throw new Error('GitHub API rate-limited (' + cRes.status + ')');
         throw new Error('commits HTTP ' + cRes.status);
       }
       const commits = await cRes.json();
       if (!Array.isArray(commits) || !commits.length) break;
-      lastFullOrPartialPage = commits;
+      allCommits = allCommits.concat(commits);
       if (commits.length < 100) break;
       page++;
     }
-    if (!lastFullOrPartialPage || !lastFullOrPartialPage.length) return null;
-    const earliest = lastFullOrPartialPage[lastFullOrPartialPage.length - 1];
-    const sha = earliest.sha;
-    const rawUrl = `https://raw.githubusercontent.com/${OI_REPO}/${sha}/${OI_FILE_PATH}`;
-    const rRes = await fetchWithTimeout(rawUrl, 8000);
-    if (!rRes.ok) throw new Error('raw HTTP ' + rRes.status);
-    const text = await rRes.text();
-    const parsed = parseIntraday(text);
-    const volRows = (parsed.rows || []).filter(r => r.vol != null && r.vol > 0);
+    if (!allCommits.length) return null;
+
+    // Newest→oldest per page, pages progressively older — reverse to scan
+    // chronologically oldest → newest.
+    const chronological = allCommits.slice().reverse();
+
+    // Content pinned to a commit SHA is immutable, so cache indefinitely.
+    const dteCache = new Map();
+    async function getDteAt(i) {
+      if (dteCache.has(i)) return dteCache.get(i);
+      const sha = chronological[i].sha;
+      const rawUrl = `https://raw.githubusercontent.com/${OI_REPO}/${sha}/${OI_FILE_PATH}`;
+      let result = null;
+      try {
+        const rRes = await fetchWithTimeout(rawUrl, 8000, 'force-cache');
+        if (rRes.ok) {
+          const text = await rRes.text();
+          const parsed = parseIntraday(text);
+          const dteNum = parseFloat(parsed.dte);
+          result = isNaN(dteNum) ? null : { parsed, dteNum };
+        }
+      } catch(e) {}
+      dteCache.set(i, result);
+      return result;
+    }
+
+    // Binary search for the first commit whose DTE has decayed to at-or-
+    // below the target band — assumes DTE decreases monotonically through
+    // the day. A miss here just falls through to the earliest-commit
+    // fallback below (safe, not silent), and gets retried later in the
+    // background.
+    let lo = 0, hi = chronological.length - 1, crossIdx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const r = await getDteAt(mid);
+      if (!r) { hi = mid - 1; continue; }
+      if (r.dteNum <= TARGET_OI_OPEN_DTE + TARGET_OI_OPEN_DTE_TOL) {
+        crossIdx = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+
+    let matchIdx = null;
+    if (crossIdx !== -1) {
+      const cand = await getDteAt(crossIdx);
+      if (cand && Math.abs(cand.dteNum - TARGET_OI_OPEN_DTE) <= TARGET_OI_OPEN_DTE_TOL) {
+        matchIdx = crossIdx;
+      } else if (crossIdx > 0) {
+        const prev = await getDteAt(crossIdx - 1);
+        if (prev && Math.abs(prev.dteNum - TARGET_OI_OPEN_DTE) <= TARGET_OI_OPEN_DTE_TOL) {
+          matchIdx = crossIdx - 1;
+        }
+      }
+    }
+
+    if (matchIdx === null) {
+      const earliest = chronological[0];
+      const sha = earliest.sha;
+      const rawUrl = `https://raw.githubusercontent.com/${OI_REPO}/${sha}/${OI_FILE_PATH}`;
+      const rRes = await fetchWithTimeout(rawUrl, 8000, 'force-cache');
+      if (!rRes.ok) throw new Error('raw HTTP ' + rRes.status);
+      const text = await rRes.text();
+      const parsed = parseIntraday(text);
+      const volRows = (parsed.rows || []).filter(r => r.vol != null && r.vol > 0);
+      if (!volRows.length) return null;
+      const minIv = Math.min(...volRows.map(r => r.vol));
+      const detail = '[oi-open] no 0.99 DTE snapshot found (binary search) — fell back to earliest commit ' + sha.slice(0,7) + ' (DTE ' + parsed.dte + ') · ' + (earliest.commit?.author?.date || '');
+      return { minIv, sha, source: 'fallback-earliest', detail };
+    }
+
+    const matched = { commit: chronological[matchIdx], sha: chronological[matchIdx].sha, parsed: (await getDteAt(matchIdx)).parsed };
+    const volRows = (matched.parsed.rows || []).filter(r => r.vol != null && r.vol > 0);
     if (!volRows.length) return null;
     const minIv = Math.min(...volRows.map(r => r.vol));
-    return { minIv, sha };
+    const detail = '[oi-open] locked from the exact 0.99 DTE snapshot · commit ' + matched.sha.slice(0,7) + ' · ' + (matched.commit.commit?.author?.date || '');
+    return { minIv, sha: matched.sha, source: 'exact', detail };
   } catch(e) {
     console.warn('[oi-open] fetchFirstOiOfDay failed:', e.message);
     return null;
@@ -1991,14 +2218,8 @@ async function fetchFirstOiOfDay() {
 
 async function initOiIvOpen() {
   loadOiIvOpen();
-  const result = await fetchFirstOiOfDay();
-  if (result && result.minIv > 0) {
-    oiIvOpen = result.minIv;
-    saveOiIvOpen(result.minIv);
-    document.getElementById('val-oi-iv-open').textContent = (result.minIv * 100).toFixed(2) + '%';
-    syncGArrowAutoField();
-    render();
-  }
+  if (oiIvOpenSource === 'exact') return; // already have the authoritative value for today
+  await retryOiIvOpenLookup(loadOiIvOpenState()?.attempts || 0);
 }
 
 function syncGArrowAutoField() {
@@ -2403,10 +2624,15 @@ const CORS_PROXIES = [
   url => 'https://corsproxy.io/?url='             + encodeURIComponent(url),
   url => 'https://thingproxy.freeboard.io/fetch/' + url,
 ];
-function fetchWithTimeout(url, timeoutMs = 5000) {
+// Fetch with a hard timeout. cacheMode defaults to 'no-cache' — always
+// revalidates with the server so data is never stale, but lets an unchanged
+// response come back as a cheap 304 instead of a full re-download. Callers
+// fetching content pinned to an immutable git commit SHA pass 'force-cache'
+// instead. extraHeaders lets callers attach e.g. an optional GitHub token.
+function fetchWithTimeout(url, timeoutMs = 5000, cacheMode = 'no-cache', extraHeaders = {}) {
   const ctrl = new AbortController();
   const tid   = setTimeout(() => ctrl.abort(), timeoutMs);
-  return fetch(url, { cache: 'no-store', signal: ctrl.signal }).finally(() => clearTimeout(tid));
+  return fetch(url, { cache: cacheMode, signal: ctrl.signal, headers: extraHeaders }).finally(() => clearTimeout(tid));
 }
 function extractPrices(data) {
   const result = data?.chart?.result?.[0];
@@ -2469,6 +2695,102 @@ function loadGoldCache() {
 function saveGoldCache(todayOpen, prevClose) {
   try { localStorage.setItem(GOLD_CACHE_KEY, JSON.stringify({ todayOpen, prevClose, ts: Date.now() })); } catch(e) {}
 }
+
+/* ================================================================
+  GENERIC LAST-KNOWN-GOOD DATA CACHE
+  Same {data, ts} + try/catch pattern as the gold-price cache above,
+  generalized so liveData/oiData/macro can each reuse it. Only ever called
+  with a *successful* fetch result — never caches an error state.
+================================================================ */
+function saveDataCache(key, data) {
+  try { localStorage.setItem(key, JSON.stringify({ data, ts: Date.now() })); } catch(e) {}
+}
+function loadDataCache(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.data == null || !parsed.ts) return null;
+    return parsed;
+  } catch(e) { return null; }
+}
+function cacheAgeLabel(ts) {
+  const ageMin = (Date.now() - ts) / 60000;
+  if (ageMin < 1) return 'just now';
+  if (ageMin < 60) return Math.round(ageMin) + ' min ago';
+  const ageH = ageMin / 60;
+  return ageH < 24 ? ageH.toFixed(1) + ' h ago' : Math.floor(ageH / 24) + ' d ago';
+}
+
+const LIVE_DATA_CACHE_KEY = 'gcf_live_data_cache_v1';
+const OI_DATA_CACHE_KEY   = 'gcf_oi_data_cache_v1';
+const MACRO_CACHE_KEY     = 'gcf_macro_cache_v1';
+
+let liveDataIsCached = false;
+let liveDataCacheTs  = null;
+let macroRenderedOnce = false;
+
+function updateDataCacheBadge() {
+  const el = document.getElementById('data-cache-badge');
+  if (!el) return;
+  if (liveDataIsCached && liveDataCacheTs) {
+    el.style.display = 'block';
+    el.textContent = '⚠ Showing cached chart data from ' + cacheAgeLabel(liveDataCacheTs) + ' — live fetch unavailable';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+// Paints whatever was cached from a previous successful load immediately at
+// boot, so the page shows the last known-good state instead of a blank
+// chart while the first live fetch is still in flight.
+function loadDataCachesAtBoot() {
+  const cachedLive = loadDataCache(LIVE_DATA_CACHE_KEY);
+  if (cachedLive) {
+    liveData = cachedLive.data;
+    liveDataIsCached = true;
+    liveDataCacheTs = cachedLive.ts;
+  }
+  const cachedOi = loadDataCache(OI_DATA_CACHE_KEY);
+  if (cachedOi) oiData = cachedOi.data;
+
+  const cachedMacro = loadDataCache(MACRO_CACHE_KEY);
+  if (cachedMacro) renderMacroData(cachedMacro.data, true, cachedMacro.ts);
+
+  updateDataCacheBadge();
+  if (cachedLive || cachedOi) render();
+}
+
+/* ================================================================
+  OPTIONAL GITHUB TOKEN — raises api.github.com's rate limit from 60/hr
+  (unauthenticated) to 5,000/hr for whoever supplies their own token. Never
+  hardcoded; stored only in the visitor's own browser localStorage and
+  attached only to api.github.com requests.
+================================================================ */
+const GITHUB_TOKEN_KEY = 'gcf_github_token_v1';
+let githubToken = null;
+
+function loadGithubToken() {
+  try { githubToken = localStorage.getItem(GITHUB_TOKEN_KEY) || null; } catch(e) {}
+  const inp = document.getElementById('inp-github-token');
+  if (inp && githubToken) inp.value = githubToken;
+}
+function saveGithubToken(token) {
+  githubToken = token || null;
+  try {
+    if (token) localStorage.setItem(GITHUB_TOKEN_KEY, token);
+    else localStorage.removeItem(GITHUB_TOKEN_KEY);
+  } catch(e) {}
+}
+function githubApiHeaders() {
+  return githubToken ? { Authorization: 'token ' + githubToken } : {};
+}
+function handleSaveGithubToken() {
+  const inp = document.getElementById('inp-github-token');
+  if (!inp) return;
+  saveGithubToken(inp.value.trim());
+  inp.blur();
+}
 async function fetchGoldPrice() {
   const meanInp = document.getElementById('inp-mean');
   if (meanInp.value !== '' && meanInp.dataset.auto !== '1' && meanInp.dataset.auto !== 'gold') return;
@@ -2507,70 +2829,85 @@ async function fetchGoldPrice() {
   MACRO NEWS FETCH
 ================================================================ */
 const MACRO_URL = 'https://raw.githubusercontent.com/0xtrvkc/BTC-Daily-Short-Call-Premium-Income-Checklist/main/data/macro.json';
+
+// Renders a parsed macro-events JSON payload. Pulled out of fetchMacro() so
+// the same logic can render a localStorage-cached payload at boot or as a
+// fallback if a live fetch fails.
+function renderMacroData(data, isCached, ts) {
+  macroRenderedOnce = true;
+  const badge = document.getElementById('macro-skip-badge');
+  const meta  = document.getElementById('macro-meta');
+  const body  = document.getElementById('macro-events-body');
+  const skip = data.skip === true;
+  badge.textContent = skip ? '⚠ Caution' : '✓ Clear';
+  badge.className   = 'macro-skip-badge ' + (skip ? 'danger' : 'ok');
+  const dateStr = data.date || '';
+  const count   = data.event_count != null ? data.event_count : (data.events ? data.events.length : 0);
+  meta.textContent = dateStr + (count ? '  ·  ' + count + ' event' + (count !== 1 ? 's' : '') : '');
+  if (isCached) meta.textContent += '  ·  ⚠ cached' + (ts ? ' (' + cacheAgeLabel(ts) + ')' : '');
+  if (!data.events || data.events.length === 0) {
+    body.innerHTML = '<div class="macro-empty">No high-impact events today — trade freely.</div>';
+    return;
+  }
+  const SOURCE_TZ = 'America/Los_Angeles';
+  function getSourceUtcOffsetHours(onDate = new Date()) {
+    const utcStr = onDate.toLocaleString('en-US', { timeZone: 'UTC', hour12: false, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+    const srcStr = onDate.toLocaleString('en-US', { timeZone: SOURCE_TZ, hour12: false, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+    const parse = s => { const [d, t] = s.split(', '); const [mo, da, yr] = d.split('/').map(Number); const [hh, mi] = t.split(':').map(Number); return Date.UTC(yr, mo - 1, da, hh === 24 ? 0 : hh, mi); };
+    const diffMs = parse(srcStr) - parse(utcStr);
+    return Math.round(diffMs / 3600000);
+  }
+  const BKK_UTC_OFFSET_HOURS = 7;
+  function etToBkk(timeStr) {
+    if (!timeStr) return '—';
+    const m = timeStr.match(/^(\d{1,2}):(\d{2})(am|pm)$/i);
+    if (!m) return timeStr;
+    let h = parseInt(m[1], 10);
+    const min = parseInt(m[2], 10);
+    const ampm = m[3].toLowerCase();
+    if (ampm === 'pm' && h !== 12) h += 12;
+    if (ampm === 'am' && h === 12) h = 0;
+    const sourceToBkkHours = BKK_UTC_OFFSET_HOURS - getSourceUtcOffsetHours();
+    const totalMin = (((h * 60 + min + sourceToBkkHours * 60) % (24 * 60)) + 24 * 60) % (24 * 60);
+    const bkkH = Math.floor(totalMin / 60);
+    const bkkM = totalMin % 60;
+    const suffix = bkkH >= 12 ? 'pm' : 'am';
+    const h12 = bkkH % 12 || 12;
+    return `${h12}:${String(bkkM).padStart(2,'0')}${suffix}`;
+  }
+  const rows = data.events.map(ev => {
+    const impact = (ev.impact || '').toUpperCase();
+    const impactLabel = impact === 'HIGH' ? 'HIGH' : impact === 'MEDIUM' ? 'MED' : impact || '—';
+    const bkkTime = etToBkk(ev.time);
+    return `<div class="macro-event-row">` +
+      `<span class="macro-impact ${impact}">${impactLabel}</span>` +
+      `<span class="macro-time" title="ET: ${ev.time || '—'}">${bkkTime}</span>` +
+      `<span class="macro-currency">${ev.currency || ''}</span>` +
+      `<span class="macro-event-name">${ev.event || '—'}</span>` +
+      `</div>`;
+  }).join('');
+  body.innerHTML = rows;
+  if (data.summary) {
+    const cleaned = data.summary.replace(/SKIP TRADE/gi, 'trade with caution').replace(/skip trade/gi, 'trade with caution');
+    const sumEl = document.createElement('div');
+    sumEl.className = 'macro-summary';
+    sumEl.textContent = '⚠ ' + cleaned;
+    body.appendChild(sumEl);
+  }
+}
+
 async function fetchMacro() {
   try {
     const res = await fetchWithTimeout(MACRO_URL, 8000);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    const badge = document.getElementById('macro-skip-badge');
-    const meta  = document.getElementById('macro-meta');
-    const body  = document.getElementById('macro-events-body');
-    const skip = data.skip === true;
-    badge.textContent = skip ? '⚠ Caution' : '✓ Clear';
-    badge.className   = 'macro-skip-badge ' + (skip ? 'danger' : 'ok');
-    const dateStr = data.date || '';
-    const count   = data.event_count != null ? data.event_count : (data.events ? data.events.length : 0);
-    meta.textContent = dateStr + (count ? '  ·  ' + count + ' event' + (count !== 1 ? 's' : '') : '');
-    if (!data.events || data.events.length === 0) {
-      body.innerHTML = '<div class="macro-empty">No high-impact events today — trade freely.</div>';
-      return;
-    }
-    const SOURCE_TZ = 'America/Los_Angeles';
-    function getSourceUtcOffsetHours(onDate = new Date()) {
-      const utcStr = onDate.toLocaleString('en-US', { timeZone: 'UTC', hour12: false, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
-      const srcStr = onDate.toLocaleString('en-US', { timeZone: SOURCE_TZ, hour12: false, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
-      const parse = s => { const [d, t] = s.split(', '); const [mo, da, yr] = d.split('/').map(Number); const [hh, mi] = t.split(':').map(Number); return Date.UTC(yr, mo - 1, da, hh === 24 ? 0 : hh, mi); };
-      const diffMs = parse(srcStr) - parse(utcStr);
-      return Math.round(diffMs / 3600000);
-    }
-    const BKK_UTC_OFFSET_HOURS = 7;
-    function etToBkk(timeStr) {
-      if (!timeStr) return '—';
-      const m = timeStr.match(/^(\d{1,2}):(\d{2})(am|pm)$/i);
-      if (!m) return timeStr;
-      let h = parseInt(m[1], 10);
-      const min = parseInt(m[2], 10);
-      const ampm = m[3].toLowerCase();
-      if (ampm === 'pm' && h !== 12) h += 12;
-      if (ampm === 'am' && h === 12) h = 0;
-      const sourceToBkkHours = BKK_UTC_OFFSET_HOURS - getSourceUtcOffsetHours();
-      const totalMin = (((h * 60 + min + sourceToBkkHours * 60) % (24 * 60)) + 24 * 60) % (24 * 60);
-      const bkkH = Math.floor(totalMin / 60);
-      const bkkM = totalMin % 60;
-      const suffix = bkkH >= 12 ? 'pm' : 'am';
-      const h12 = bkkH % 12 || 12;
-      return `${h12}:${String(bkkM).padStart(2,'0')}${suffix}`;
-    }
-    const rows = data.events.map(ev => {
-      const impact = (ev.impact || '').toUpperCase();
-      const impactLabel = impact === 'HIGH' ? 'HIGH' : impact === 'MEDIUM' ? 'MED' : impact || '—';
-      const bkkTime = etToBkk(ev.time);
-      return `<div class="macro-event-row">` +
-        `<span class="macro-impact ${impact}">${impactLabel}</span>` +
-        `<span class="macro-time" title="ET: ${ev.time || '—'}">${bkkTime}</span>` +
-        `<span class="macro-currency">${ev.currency || ''}</span>` +
-        `<span class="macro-event-name">${ev.event || '—'}</span>` +
-        `</div>`;
-    }).join('');
-    body.innerHTML = rows;
-    if (data.summary) {
-      const cleaned = data.summary.replace(/SKIP TRADE/gi, 'trade with caution').replace(/skip trade/gi, 'trade with caution');
-      const sumEl = document.createElement('div');
-      sumEl.className = 'macro-summary';
-      sumEl.textContent = '⚠ ' + cleaned;
-      body.appendChild(sumEl);
-    }
+    saveDataCache(MACRO_CACHE_KEY, data);
+    renderMacroData(data, false);
   } catch(e) {
+    if (!macroRenderedOnce) {
+      const cached = loadDataCache(MACRO_CACHE_KEY);
+      if (cached) { renderMacroData(cached.data, true, cached.ts); return; }
+    }
     const body = document.getElementById('macro-events-body');
     if (body) body.innerHTML = '<div class="macro-empty" style="color:var(--danger)">⚠ Failed to load macro events: ' + e.message + '</div>';
   }
@@ -2580,7 +2917,7 @@ async function fetchMacro() {
   SNAPSHOT-LOG TIMESTAMPS
 ================================================================ */
 const SNAPLOG_DB_URL      = 'https://raw.githubusercontent.com/0xtrvkc/itd-oi-db/main/data/vol2vol.db';
-const SNAPLOG_POLL_MS     = 60000;
+const SNAPLOG_POLL_MS     = 5 * 60 * 1000; // matches upstream collector's ~5min rewrite cadence
 let snaplogSqlPromise   = null;
 let snaplogFetching     = false;
 let snaplogIntradayAt   = null;
@@ -2605,7 +2942,7 @@ async function fetchSnaplogTimestamps() {
   snaplogFetching = true;
   try {
     const SQL = await getSqlJs();
-    const res = await fetch(`${SNAPLOG_DB_URL}?t=${Date.now()}`, { cache: 'no-store' });
+    const res = await fetch(SNAPLOG_DB_URL, { cache: 'no-cache' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const buf = await res.arrayBuffer();
     const db  = new SQL.Database(new Uint8Array(buf));
@@ -2630,7 +2967,7 @@ async function loadHistoryFromDb(retriesLeft = 10) {
       throw new Error('sql.js failed to load');
     }
     const SQL = await getSqlJs();
-    const res = await fetch(`${SNAPLOG_DB_URL}?t=${Date.now()}`, { cache: 'no-store' });
+    const res = await fetch(SNAPLOG_DB_URL, { cache: 'no-cache' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const buf = await res.arrayBuffer();
     const db = new SQL.Database(new Uint8Array(buf));
@@ -2672,11 +3009,13 @@ async function loadHistoryFromDb(retriesLeft = 10) {
   BOOT
 ================================================================ */
 initGaugeBands();
+loadGithubToken();      // restore any previously-saved optional GitHub token (client-side only)
+loadDataCachesAtBoot(); // paint last known-good chart/macro data instantly, before the first live fetch lands
 initOiIvOpen();
 loadHistory();
 loadHistoryFromApi();
 loadHistoryFromDb();
-setInterval(loadHistoryFromDb, 3 * 60 * 1000);
+setInterval(loadHistoryFromDb, SNAPLOG_POLL_MS);
 fetchGoldPrice();
 fetchData();
 fetchMacro();
