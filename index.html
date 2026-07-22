@@ -476,7 +476,7 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
               <input type="number" id="inp-sd" value="" placeholder="auto" step="0.1" min="0.1" data-auto="1">
               <button id="btn-sd-mode" class="mode-btn active" onclick="toggleSdMode()">⟳auto</button>
             </div>
-            <div class="input-sub" id="sd-formula-lbl">IV × Mean × √(DTE/365)</div>
+            <div class="input-sub" id="sd-formula-lbl">IV ÷ 16 × Mean</div>
           </div>
 
           <div class="input-group">
@@ -1778,15 +1778,18 @@ async function fetchData() {
         }
       }
       if (isNaN(ivAtFut)) ivAtFut = parseFloat(liveData.vol);
-      if (!isNaN(ivAtFut)&&!isNaN(dte)&&dte>0&&ivAtFut>0) {
+      if (!isNaN(dte)&&dte>0) {
         const meanForSd = state.mean > 0 ? state.mean : fut;
-        computedSd=meanForSd*(ivAtFut/100)*Math.sqrt(dte/365);
-        const sdInp=document.getElementById('inp-sd');
-        if (sdAutoMode && (sdInp.value===''||sdInp.dataset.auto==='1')) {
-          sdInp.value=computedSd.toFixed(1);
-          sdInp.dataset.auto='1';
-          state.sd=computedSd;
-          document.getElementById('sd-formula-lbl').textContent=`IV@fut:${ivAtFut.toFixed(1)}% DTE:${dte} → σ=${computedSd.toFixed(0)}`;
+        const ivForSd = (garrowIvOverride != null) ? garrowIvOverride : oiIvOpen;
+        if (ivForSd != null && ivForSd > 0) {
+          computedSd=(ivForSd/16)*meanForSd;
+          const sdInp=document.getElementById('inp-sd');
+          if (sdAutoMode && (sdInp.value===''||sdInp.dataset.auto==='1')) {
+            sdInp.value=computedSd.toFixed(1);
+            sdInp.dataset.auto='1';
+            state.sd=computedSd;
+            document.getElementById('sd-formula-lbl').textContent=`IV:${(ivForSd*100).toFixed(1)}% ÷16 → σ=${computedSd.toFixed(0)}`;
+          }
         }
       }
     }
@@ -1878,23 +1881,12 @@ document.getElementById('inp-mean').addEventListener('input',function(){
     const sdInp = document.getElementById('inp-sd');
     if (sdInp.dataset.auto==='1' && liveData && liveData.dte) {
       const dte = parseFloat(liveData.dte);
-      const fut = liveData.future;
-      let ivAtFut = NaN;
-      if (liveData.rows) {
-        const vrows = liveData.rows.filter(r=>r.vol!=null&&r.vol>0);
-        const below = vrows.filter(r=>r.strike<=fut).slice(-1)[0];
-        const above = vrows.filter(r=>r.strike>=fut)[0];
-        if (below && above) {
-          const t2 = below.strike===above.strike ? 0 : (fut-below.strike)/(above.strike-below.strike);
-          ivAtFut = (below.vol + t2*(above.vol-below.vol))*100;
-        }
-      }
-      if (isNaN(ivAtFut)) ivAtFut = parseFloat(liveData.vol);
-      if (!isNaN(ivAtFut) && !isNaN(dte) && dte>0 && ivAtFut>0 && v>0) {
-        computedSd = v*(ivAtFut/100)*Math.sqrt(dte/365);
+      const ivForSd = (garrowIvOverride != null) ? garrowIvOverride : oiIvOpen;
+      if (!isNaN(dte) && dte>0 && ivForSd != null && ivForSd > 0 && v>0) {
+        computedSd = (ivForSd/16)*v;
         sdInp.value = computedSd.toFixed(1);
         state.sd = computedSd;
-        document.getElementById('sd-formula-lbl').textContent=`IV@fut:${ivAtFut.toFixed(1)}% DTE:${dte} → σ=${computedSd.toFixed(0)}`;
+        document.getElementById('sd-formula-lbl').textContent=`IV:${(ivForSd*100).toFixed(1)}% ÷16 → σ=${computedSd.toFixed(0)}`;
       }
     }
     render();
