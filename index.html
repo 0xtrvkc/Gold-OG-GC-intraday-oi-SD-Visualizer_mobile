@@ -342,6 +342,84 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
 /* Bottom sheet overlay for settings on small screens */
 .sheet-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 90; display: none; }
 .sheet-overlay.show { display: block; }
+/* ── DTE LOW-IV LADDER ──
+   Small table sitting inside its own collapsible card. For each 0.1-wide
+   DTE rung from ~1.0 down to 0.0, shows the lowest settle-vol ("low iv")
+   strike reading from the nearest actual snapshot today. Real dte
+   trajectories rarely start exactly at 1.0 (1.02, 0.9x, 0.77 have all
+   been observed), so rungs with no snapshot within tolerance are shown
+   as "—" rather than guessed — see DTE_LADDER_MATCH_TOLERANCE.
+   Laid out as one compact horizontal strip that scrolls sideways on
+   narrow screens instead of growing tall/wrapping. Full detail (exact
+   time, nearest-dte note) lives in the title="" tooltip on each chip. */
+.dte-ladder-box {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--line2);
+  background: var(--bg2);
+  border-radius: 6px;
+  padding: 0 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+.dte-ladder-empty {
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--fg2);
+  display: flex;
+  align-items: center;
+  height: 40px;
+  white-space: nowrap;
+}
+#dte-ladder-rows {
+  display: flex;
+  align-items: stretch;
+  flex: 1 1 auto;
+  width: 100%;
+}
+.dte-ladder-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 44px;
+  flex: 1 1 0;
+  padding: 7px 4px;
+  border-right: 1px solid var(--line);
+  cursor: default;
+}
+.dte-ladder-row:last-child { border-right: none; }
+.dte-ladder-row.is-empty { opacity: 0.4; }
+.dte-ladder-row.is-current { background: var(--bg3); }
+.dte-ladder-dte {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--fg3);
+  white-space: nowrap;
+}
+.dte-ladder-row.is-current .dte-ladder-dte { color: var(--fg1); }
+.dte-ladder-iv {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--fg0);
+  white-space: nowrap;
+}
+.dte-ladder-row.is-empty .dte-ladder-iv { color: var(--fg3); font-weight: 400; }
+.dte-ladder-tag {
+  display: inline-block;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: #2a8a4a;
+  margin-top: 1px;
+}
+[data-theme="dark"] .dte-ladder-tag { background: #48a868; }
 </style>
 </head>
 <body>
@@ -476,7 +554,7 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
               <input type="number" id="inp-sd" value="" placeholder="auto" step="0.1" min="0.1" data-auto="1">
               <button id="btn-sd-mode" class="mode-btn active" onclick="toggleSdMode()">⟳auto</button>
             </div>
-            <div class="input-sub" id="sd-formula-lbl">IV ÷ 16 × Mean</div>
+            <div class="input-sub" id="sd-formula-lbl">Default: Open×IV@.7/.8dte×√(dte/365) · fallback: IV÷16×Mean</div>
           </div>
 
           <div class="input-group">
@@ -495,7 +573,7 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
               <input type="number" id="inp-garrow-iv" value="" placeholder="auto" step="0.01" min="0" data-auto="1">
               <button id="btn-garrow-reset" class="btn-reset" onclick="resetGArrowIv()">↺</button>
             </div>
-            <div class="input-sub" id="garrow-formula-lbl">OI IV open ÷ 16 × Mean</div>
+            <div class="input-sub" id="garrow-formula-lbl">Default: Open×IV@.7/.8dte×√(dte/365) · fallback: OI IV open÷16×Mean</div>
           </div>
 
           <div class="input-group full">
@@ -563,6 +641,27 @@ footer { font-size: 9px; color: var(--fg3); border-top: 1px solid var(--line); p
         <div class="legend-item" style="grid-column:1/-1">
           <div class="legend-line" style="background:#9a9080;"></div>
           <div><span class="legend-name" style="color:#9a9080">Vol Settle</span><span class="legend-desc">Implied volatility curve</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DTE LADDER — small table of today's per-rung low-IV readings.
+       Theoretically today's dte runs 1.0 → 0.0; in practice the first
+       snapshot of the day can land anywhere (1.02, 0.9x, 0.77, ...), so
+       this only fills in rungs that actually have a nearby snapshot and
+       leaves the rest as "—" rather than guessing. See loadDteLadder(). -->
+  <div class="card" id="card-dte-ladder">
+    <div class="card-hd" onclick="toggleCard('card-dte-ladder')">
+      <div class="card-hd-left"><span class="card-title">DTE Ladder</span></div>
+      <span class="card-hd-meta" id="dte-ladder-meta">—</span>
+      <span class="chev">▸</span>
+    </div>
+    <div class="card-body">
+      <div class="card-body-pad" style="padding-top:10px;">
+        <div class="dte-ladder-box" id="dte-ladder-box">
+          <div class="dte-ladder-empty" id="dte-ladder-empty">Loading today's DTE ladder…</div>
+          <div id="dte-ladder-rows"></div>
         </div>
       </div>
     </div>
@@ -1154,20 +1253,20 @@ function drawVolCurve(c, rows) {
 
 /* ================================================================
   DRAW ARROW
+  Half-length comes from resolveExpectedMove(): default formula is
+  (open future price) × (IV at 0.7-or-0.8 dte today) × √(dte/365);
+  falls back to (locked OI IV-open, or live min-IV) ÷ 16 × mean until
+  today's session has produced a 0.7/0.8 dte snapshot. A manual
+  override (garrowIvOverride) takes priority over both. The arrow
+  itself is always drawn centered on the current mean — only its
+  half-length (the distance magnitude) comes from whichever formula
+  is active.
 ================================================================ */
 function drawArrow(c, rows) {
   const g = clearG('g-arrow');
-  let ivForArrow = (garrowIvOverride != null) ? garrowIvOverride : oiIvOpen;
-  if (!ivForArrow) {
-    const srcRows = (oiData && oiData.rows && oiData.rows.length) ? oiData.rows : rows;
-    if (!srcRows || !srcRows.length) return;
-    const visible = srcRows.filter(r=>r.strike>=c.xMin&&r.strike<=c.xMax&&r.vol!=null&&r.vol>0);
-    if (!visible.length) return;
-    ivForArrow = Math.min(...visible.map(r=>r.vol));
-  }
-  if (!ivForArrow || ivForArrow <= 0) return;
-
-  const halfLen = (ivForArrow / 16) * state.mean;
+  const result = resolveExpectedMove(liveData ? liveData.future : null);
+  if (!result || !(result.distance > 0)) return;
+  const halfLen = result.distance;
   const arrowY = c.plotB-280;
   const mx=c.toSvgX(state.mean);
   const lx=c.toSvgX(Math.max(state.mean-halfLen,c.xMin));
@@ -1186,11 +1285,11 @@ function drawArrow(c, rows) {
     x: mx, y: arrowY - 5, 'text-anchor': 'middle', 'font-size': '7',
     'font-family': 'IBM Plex Mono, monospace', fill: tc('#a09080', '#505050')
   });
-  title.textContent = (garrowIvOverride != null)
-    ? 'Expected Distances (IV ' + (garrowIvOverride * 100).toFixed(2) + '% · manual)'
-    : oiIvOpen
-      ? 'Expected Distances (OI IV open ' + (oiIvOpen * 100).toFixed(2) + '%)'
-      : 'Expected Distances';
+  title.textContent = result.formula === 'manual'
+    ? 'Exp. Distances (IV ' + (result.iv * 100).toFixed(2) + '% · manual)'
+    : result.formula === 'default'
+      ? `Exp. Distances (${result.dte}dte IV ${(result.iv * 100).toFixed(2)}%)`
+      : `Exp. Distances (IV ${(result.iv * 100).toFixed(2)}% ÷16×Mean)`;
   g.appendChild(title);
 }
 
@@ -1767,6 +1866,7 @@ async function fetchData() {
     if (liveData.title) document.getElementById('h-title').textContent=liveData.title.includes('SD')?liveData.title:'SD Visualizer';
     if (liveData.future!=null && liveData.dte) {
       const dte=parseFloat(liveData.dte), fut=liveData.future;
+      maybeLockFutureOpen(fut);
       let ivAtFut = NaN;
       if (liveData.rows) {
         const vrows = liveData.rows.filter(r=>r.vol!=null&&r.vol>0);
@@ -1779,16 +1879,15 @@ async function fetchData() {
       }
       if (isNaN(ivAtFut)) ivAtFut = parseFloat(liveData.vol);
       if (!isNaN(dte)&&dte>0) {
-        const meanForSd = state.mean > 0 ? state.mean : fut;
-        const ivForSd = (garrowIvOverride != null) ? garrowIvOverride : oiIvOpen;
-        if (ivForSd != null && ivForSd > 0) {
-          computedSd=(ivForSd/16)*meanForSd;
+        const result = resolveExpectedMove(fut);
+        if (result && result.distance > 0) {
+          computedSd = result.distance;
           const sdInp=document.getElementById('inp-sd');
           if (sdAutoMode && (sdInp.value===''||sdInp.dataset.auto==='1')) {
             sdInp.value=computedSd.toFixed(1);
             sdInp.dataset.auto='1';
             state.sd=computedSd;
-            document.getElementById('sd-formula-lbl').textContent=`IV:${(ivForSd*100).toFixed(1)}% ÷16 → σ=${computedSd.toFixed(0)}`;
+            document.getElementById('sd-formula-lbl').textContent=`${result.label} → σ=${computedSd.toFixed(0)}`;
           }
         }
       }
@@ -1879,14 +1978,13 @@ document.getElementById('inp-mean').addEventListener('input',function(){
     this.dataset.auto='';
     document.getElementById('btn-mean-reset').classList.add('show');
     const sdInp = document.getElementById('inp-sd');
-    if (sdInp.dataset.auto==='1' && liveData && liveData.dte) {
-      const dte = parseFloat(liveData.dte);
-      const ivForSd = (garrowIvOverride != null) ? garrowIvOverride : oiIvOpen;
-      if (!isNaN(dte) && dte>0 && ivForSd != null && ivForSd > 0 && v>0) {
-        computedSd = (ivForSd/16)*v;
+    if (sdInp.dataset.auto==='1') {
+      const result = resolveExpectedMove(liveData ? liveData.future : null);
+      if (result && result.distance > 0) {
+        computedSd = result.distance;
         sdInp.value = computedSd.toFixed(1);
         state.sd = computedSd;
-        document.getElementById('sd-formula-lbl').textContent=`IV:${(ivForSd*100).toFixed(1)}% ÷16 → σ=${computedSd.toFixed(0)}`;
+        document.getElementById('sd-formula-lbl').textContent=`${result.label} → σ=${computedSd.toFixed(0)}`;
       }
     }
     render();
@@ -1933,6 +2031,7 @@ function resetMean() {
     meanInp.dataset.auto = '1';
     document.getElementById('btn-mean-reset').classList.remove('show');
     document.getElementById('mean-lbl').textContent = `Future: ${liveData.future.toLocaleString()}  Δ: ${liveData.futChg}`;
+    recomputeAutoSd();
     render();
   }
 }
@@ -1995,6 +2094,133 @@ const OI_FILE_PATH = 'OIData.txt';
 let oiIvOpen = null;        // decimal form e.g. 0.123
 let oiIvOpenSource = null;  // 'exact' | 'fallback-earliest' | 'fallback-live' | null
 let oiIvOpenRetryTimer = null;
+
+// ── Expected-Move DEFAULT formula inputs ──────────────────────────────
+// (open future price) × (IV at 0.7 or 0.8 dte today) × √(0.7-or-0.8/365)
+// futureOpen: the first live future price observed today, locked the same
+// way oiIvOpen's cheapest fallback works (first tick of the day, never
+// overwritten until the calendar date rolls over). Simpler than oiIvOpen's
+// git-history "exact 0.99 dte" lookup on purpose — there is no equivalent
+// authoritative source for "future price at open" to reconcile against.
+let futureOpen = null;
+let futureOpenDate = null; // yyyy-mm-dd this value was locked for
+const FUTURE_OPEN_KEY = 'sdviz_future_open_v1';
+
+// dteLadderMatched: populated by loadDteLadder()/renderDteLadder() — the
+// same per-0.1-rung {rung, point:{t,dte,lowIv}|null} array the DTE Ladder
+// card renders. Reused here (rather than re-querying the db) to find
+// "IV at 0.7 or 0.8 dte" for the default expected-move formula.
+let dteLadderMatched = null;
+
+// ── futureOpen persistence ──────────────────────────────────────────
+function loadFutureOpenState() {
+  try {
+    const raw = localStorage.getItem(FUTURE_OPEN_KEY);
+    if (!raw) return null;
+    const state = JSON.parse(raw);
+    const today = new Date().toISOString().slice(0, 10);
+    if (state.date !== today) return null; // yesterday's lock — start fresh
+    return state;
+  } catch(e) { return null; }
+}
+
+function saveFutureOpenState(price, date) {
+  try { localStorage.setItem(FUTURE_OPEN_KEY, JSON.stringify({ price, date })); } catch(e) {}
+}
+
+// Restores today's locked future-open price, if any, at boot.
+function loadFutureOpen() {
+  const state = loadFutureOpenState();
+  if (!state || !(state.price > 0)) return;
+  futureOpen = state.price;
+  futureOpenDate = state.date;
+}
+
+// Locks in futureOpen the first time a live future price is seen today.
+// Never overwritten afterward (same date) — this is deliberately "first
+// tick", not an attempt to reconcile against an authoritative open print.
+function maybeLockFutureOpen(price) {
+  if (!(price > 0)) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (futureOpen != null && futureOpenDate === today) return; // already locked for today
+  futureOpen = price;
+  futureOpenDate = today;
+  saveFutureOpenState(price, today);
+}
+
+// Returns {iv, dte, t} using the earliest-in-session rung (prefer 0.8 dte,
+// then 0.7 dte) that the DTE Ladder card has actually matched today, or
+// null if neither has landed yet.
+function getDefaultMoveIvDte() {
+  if (!dteLadderMatched) return null;
+  for (const rung of [0.8, 0.7]) {
+    const m = dteLadderMatched.find(x => x.rung === rung);
+    if (m && m.point) return { iv: m.point.lowIv, dte: rung, t: m.point.t };
+  }
+  return null;
+}
+
+/* ================================================================
+  EXPECTED MOVE — shared by the "Expected Distances" arrow and the σ
+  auto-default. Priority:
+    1. Manual G-Arrow override (garrowIvOverride) — always wins, unchanged.
+    2. DEFAULT: (open future price) × (IV at 0.7 or 0.8 dte today, 0.8
+       preferred) × √(that dte / 365) — the full expected-move formula,
+       using today's actual future-at-open and a mid-session IV reading
+       instead of the /16 shorthand.
+    3. FALLBACK (original formula, used until #2's inputs exist — i.e.
+       before today's session has reached 0.7/0.8 dte, or futureOpen
+       hasn't locked yet): (locked OI IV-open, or live OI/Intraday
+       min-IV) ÷ 16 × mean.
+  Returns null only if nothing above is computable yet.
+================================================================ */
+function resolveExpectedDistanceIv() {
+  if (garrowIvOverride != null) return garrowIvOverride;
+  if (oiIvOpen) return oiIvOpen;
+  const srcRows = (oiData && oiData.rows && oiData.rows.length) ? oiData.rows : (liveData ? liveData.rows : null);
+  if (!srcRows || !srcRows.length) return null;
+  const visible = srcRows.filter(r => r.vol != null && r.vol > 0);
+  if (!visible.length) return null;
+  return Math.min(...visible.map(r => r.vol));
+}
+
+function resolveExpectedMove(meanFallback) {
+  const mean = state.mean > 0 ? state.mean : meanFallback;
+
+  if (garrowIvOverride != null) {
+    if (!(mean > 0)) return null;
+    return {
+      distance: (garrowIvOverride / 16) * mean,
+      formula: 'manual', dte: null, iv: garrowIvOverride, mean,
+      label: `Manual override — IV ${(garrowIvOverride * 100).toFixed(2)}% ÷16 × Mean`
+    };
+  }
+
+  // If Mean (μ) has been manually overridden, use that typed value as the
+  // default formula's price term instead of the locked open price — a
+  // manual Mean edit is the person saying "pretend price is X", and that
+  // should flow through to σ and the arrow, not just the fallback formula.
+  const meanInp = document.getElementById('inp-mean');
+  const meanIsManual = meanInp && meanInp.dataset.auto === '' && meanInp.value !== '';
+  const priceForDefault = meanIsManual ? mean : futureOpen;
+
+  const dflt = getDefaultMoveIvDte();
+  if (dflt && priceForDefault > 0) {
+    const distance = priceForDefault * dflt.iv * Math.sqrt(dflt.dte / 365);
+    return {
+      distance, formula: 'default', dte: dflt.dte, iv: dflt.iv, mean: priceForDefault,
+      label: `Default — ${meanIsManual ? 'Mean' : 'Open'} ${priceForDefault.toLocaleString()} × IV@${dflt.dte}dte ${(dflt.iv * 100).toFixed(2)}% × √(${dflt.dte}/365)`
+    };
+  }
+
+  const ivDec = resolveExpectedDistanceIv();
+  if (!ivDec || ivDec <= 0 || !(mean > 0)) return null;
+  return {
+    distance: (ivDec / 16) * mean,
+    formula: 'fallback', dte: null, iv: ivDec, mean,
+    label: `Fallback (no 0.7/0.8dte IV yet) — ${oiIvOpen != null ? 'OI IV open' : 'IV'} ${(ivDec * 100).toFixed(2)}% ÷16 × Mean`
+  };
+}
 
 // Confidence ranking — a result can only ever *replace* the current value if
 // its source outranks (or ties, for a same-source refresh) what's already
@@ -2238,13 +2464,38 @@ function syncGArrowAutoField() {
     inp.value = (oiIvOpen * 100).toFixed(2);
   }
 }
+// Std Dev (σ) auto-default. Shared entry point for anything that needs to
+// refresh σ outside of the main fetch/mean-input paths (e.g. the moment the
+// DTE Ladder fills in a 0.7/0.8dte rung, or when G-Arrow IV resets to auto).
+// Only touches the σ field/state while it's actually in auto mode; a
+// manually-entered σ is left alone.
+function recomputeAutoSd() {
+  const result = resolveExpectedMove(liveData ? liveData.future : null);
+  if (!result || !(result.distance > 0)) return;
+  computedSd = result.distance;
+  const sdInp = document.getElementById('inp-sd');
+  if (sdAutoMode && sdInp && (sdInp.value === '' || sdInp.dataset.auto === '1')) {
+    sdInp.value = computedSd.toFixed(1);
+    sdInp.dataset.auto = '1';
+    state.sd = computedSd;
+    const lbl = document.getElementById('sd-formula-lbl');
+    if (lbl) lbl.textContent = `${result.label} → σ=${computedSd.toFixed(0)}`;
+  }
+}
+
 function resetGArrowIv() {
   const inp = document.getElementById('inp-garrow-iv');
   garrowIvOverride = null;
   inp.dataset.auto = '1';
   if (oiIvOpen != null) inp.value = (oiIvOpen * 100).toFixed(2);
   document.getElementById('btn-garrow-reset').classList.remove('show');
-  document.getElementById('garrow-formula-lbl').textContent = 'OI IV open ÷ 16 × Mean';
+  const result = resolveExpectedMove(liveData ? liveData.future : null);
+  document.getElementById('garrow-formula-lbl').textContent = result
+    ? (result.formula === 'default'
+        ? `Default: Open×IV@${result.dte}dte×√(${result.dte}/365)`
+        : `Fallback: OI IV open ÷16 × Mean`)
+    : 'OI IV open ÷ 16 × Mean';
+  recomputeAutoSd(); // σ auto-default tracks the same formula the arrow uses
   render();
 }
 document.getElementById('inp-garrow-iv').addEventListener('input', function() {
@@ -3003,16 +3254,166 @@ async function loadHistoryFromDb(retriesLeft = 10) {
 }
 
 /* ================================================================
+  DTE LOW-IV LADDER
+  Independent fetch of the same SNAPLOG_DB_URL (same reasoning as
+  loadHistoryFromDb above: unchanged 18–28MB db round-trips as a cheap
+  304, so a second decoupled reader costs effectively nothing extra).
+  For each 0.1-wide rung from 1.0 down to 0.0, finds the single
+  snapshot whose dte is CLOSEST to that rung. If nothing today came
+  within DTE_LADDER_MATCH_TOLERANCE dte of a rung, that row is left
+  blank ("—") instead of showing a misleading nearest-anything match —
+  real days that start at e.g. 0.77 dte simply won't have 1.0/0.9
+  rungs, and the table should say so rather than fake it.
+================================================================ */
+const DTE_LADDER_RUNGS = Array.from({length: 11}, (_, i) => Math.round((1 - i * 0.1) * 10) / 10); // [1.0, 0.9, ..., 0.0]
+const DTE_LADDER_MATCH_TOLERANCE = 0.06; // dte units; beyond this a rung is left blank, not guessed
+
+function fmtDteLadderPct(v, d = 4) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  return (Number(v) * 100).toFixed(d) + '%';
+}
+
+function fmtDteLadderTime(t) {
+  return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// Groups raw per-strike intraday rows for today into one point per
+// fetched_at: {t, dte, lowIv}. lowIv mirrors itd-oi-db's own "low iv"
+// definition — MIN of positive, non-null vol_settle across that
+// snapshot's strikes.
+function buildDteLadderPoints(rows) {
+  const byT = new Map();
+  for (const row of rows) {
+    const [fetchedAt, dte, volSettle] = row;
+    const t = new Date(fetchedAt).getTime();
+    let pt = byT.get(t);
+    if (!pt) { pt = { t, dte: dte != null ? Number(dte) : null, lowIv: null }; byT.set(t, pt); }
+    if (volSettle != null && !isNaN(volSettle) && volSettle > 0) {
+      if (pt.lowIv === null || volSettle < pt.lowIv) pt.lowIv = volSettle;
+    }
+  }
+  return Array.from(byT.values())
+    .filter(p => p.dte != null && p.lowIv != null)
+    .sort((a, b) => a.t - b.t);
+}
+
+// For each target rung, pick the closest point by |dte - rung|; reject
+// matches beyond DTE_LADDER_MATCH_TOLERANCE rather than showing a
+// stretch match from a different part of the day.
+function matchDteLadderRungs(points) {
+  return DTE_LADDER_RUNGS.map(rung => {
+    let best = null, bestDiff = Infinity;
+    for (const p of points) {
+      const diff = Math.abs(p.dte - rung);
+      if (diff < bestDiff) { bestDiff = diff; best = p; }
+    }
+    const matched = best && bestDiff <= DTE_LADDER_MATCH_TOLERANCE;
+    return { rung, point: matched ? best : null };
+  });
+}
+
+function renderDteLadder(points) {
+  const box   = document.getElementById('dte-ladder-box');
+  const empty = document.getElementById('dte-ladder-empty');
+  const rowsEl = document.getElementById('dte-ladder-rows');
+  const metaEl = document.getElementById('dte-ladder-meta');
+  if (!box || !rowsEl) return;
+
+  if (!points.length) {
+    empty.textContent = 'No intraday IV snapshots yet today.';
+    empty.style.display = '';
+    rowsEl.innerHTML = '';
+    if (metaEl) metaEl.textContent = '—';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const matched = matchDteLadderRungs(points);
+  const filled = matched.filter(m => m.point).length;
+  if (metaEl) metaEl.textContent = `${filled}/${DTE_LADDER_RUNGS.length} rungs`;
+
+  // Cache for the default expected-move formula (see resolveExpectedMove()),
+  // then re-run it: the 0.7/0.8 dte rungs typically aren't filled yet on the
+  // very first call (today's session has barely started), so this is what
+  // upgrades the arrow/σ from the fallback formula to the default one the
+  // moment enough of the session has actually happened.
+  dteLadderMatched = matched;
+  recomputeAutoSd();
+  render();
+
+  // The point with the smallest dte seen so far is "current" (closest to
+  // expiry) — a small visual anchor, not a claim about which rung is "next".
+  const minDtePoint = points.reduce((a, b) => (b.dte < a.dte ? b : a), points[0]);
+
+  rowsEl.innerHTML = matched.map(({ rung, point }) => {
+    const isCurrent = point && point === minDtePoint;
+    if (!point) {
+      return `<div class="dte-ladder-row is-empty" title="${rung.toFixed(1)} dte — no snapshot within ±${DTE_LADDER_MATCH_TOLERANCE} dte today">
+        <span class="dte-ladder-dte">${rung.toFixed(1)}</span>
+        <span class="dte-ladder-iv">—</span>
+      </div>`;
+    }
+    const diff = Math.abs(point.dte - rung);
+    const nearNote = diff < 0.005 ? '' : `, nearest was ${point.dte.toFixed(2)} dte`;
+    const titleText = `${rung.toFixed(1)} dte low iv: ${fmtDteLadderPct(point.lowIv)} · ${fmtDteLadderTime(point.t)}${nearNote}`;
+    return `<div class="dte-ladder-row${isCurrent ? ' is-current' : ''}" title="${titleText}">
+      <span class="dte-ladder-dte">${rung.toFixed(1)}${isCurrent ? '<span class="dte-ladder-tag"></span>' : ''}</span>
+      <span class="dte-ladder-iv">${fmtDteLadderPct(point.lowIv, 2)}</span>
+    </div>`;
+  }).join('');
+}
+
+async function loadDteLadder(retriesLeft = 10) {
+  try {
+    if (typeof initSqlJs === 'undefined') {
+      if (retriesLeft > 0) { setTimeout(() => loadDteLadder(retriesLeft - 1), 500); return; }
+      throw new Error('sql.js failed to load');
+    }
+    const SQL = await getSqlJs();
+    const res = await fetch(SNAPLOG_DB_URL, { cache: 'no-cache' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const buf = await res.arrayBuffer();
+    const db = new SQL.Database(new Uint8Array(buf));
+    try {
+      const { tStart, tEnd } = dayWindow();
+      const startIso = new Date(tStart).toISOString();
+      const endIso   = new Date(tEnd).toISOString();
+      const iRes = db.exec(
+        `SELECT fetched_at, dte, vol_settle
+         FROM intraday
+         WHERE fetched_at >= '${startIso}' AND fetched_at < '${endIso}'
+         ORDER BY fetched_at ASC`
+      );
+      const rows = iRes[0] ? iRes[0].values : [];
+      const points = buildDteLadderPoints(rows);
+      renderDteLadder(points);
+      console.log(`[dte-ladder] ${points.length} intraday snapshots today, matched against ${DTE_LADDER_RUNGS.length} rungs`);
+    } finally {
+      db.close();
+    }
+  } catch (e) {
+    console.log('[dte-ladder] load failed:', e.message);
+    const empty = document.getElementById('dte-ladder-empty');
+    const rowsEl = document.getElementById('dte-ladder-rows');
+    if (empty) { empty.textContent = 'Could not load DTE ladder (' + e.message + ').'; empty.style.display = ''; }
+    if (rowsEl) rowsEl.innerHTML = '';
+  }
+}
+
+/* ================================================================
   BOOT
 ================================================================ */
 initGaugeBands();
 loadGithubToken();      // restore any previously-saved optional GitHub token (client-side only)
 loadDataCachesAtBoot(); // paint last known-good chart/macro data instantly, before the first live fetch lands
 initOiIvOpen();
+loadFutureOpen();       // restore today's locked future-at-open price (default expected-move formula input)
 loadHistory();
 loadHistoryFromApi();
 loadHistoryFromDb();
+loadDteLadder();        // small DTE Low-IV ladder table
 setInterval(loadHistoryFromDb, SNAPLOG_POLL_MS);
+setInterval(loadDteLadder, SNAPLOG_POLL_MS); // same cadence as the upstream collector's rewrite
 fetchGoldPrice();
 fetchData();
 fetchMacro();
